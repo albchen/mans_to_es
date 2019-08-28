@@ -733,7 +733,7 @@ class MansToEs:
                             + [
                                 row[mf]
                                 for mf in info["subtypes"][sb]["message_fields"]
-                                if row[mf]
+                                if mf and row[mf]
                             ]
                         )
                         + " [%s]" % row["datetype"],
@@ -752,7 +752,10 @@ class MansToEs:
                 df["message"] = df.apply(
                     lambda row: " - ".join(
                         [row["message"]]
-                        + [row[mf] for mf in info["message_fields"][row["datetype"]]]
+                        + [
+                            row[mf] for mf in info["message_fields"][row["datetype"]]
+                            if mf and row[mf]
+                          ]
                     )
                     + " [%s]" % row["datetype"],
                     axis=1,
