@@ -11,7 +11,7 @@ import shutil
 import datetime
 import ciso8601
 
-import xmltodict
+from lxml import etree as lxml_etree
 
 import pandas as pd
 
@@ -30,7 +30,7 @@ url_logger.setLevel(logging.ERROR)
 pd.options.mode.chained_assignment = None
 
 FORMAT = "%(asctime)-15s %(message)s"
-logging.basicConfig(filename="mans_to_es.log", level=logging.DEBUG, format=FORMAT)
+logging.basicConfig(filename="/tmp/mans_to_es.log", level=logging.DEBUG, format=FORMAT)
 
 MANS_FIELDS = {
     "persistence": {
@@ -231,34 +231,49 @@ class MansToEs:
         self.generic_items = {}
 
         es = Elasticsearch([self.es_info])
+        
         if not es.ping():
-            raise ValueError("Connection failed")
-
+            raise ValueError("Connection failed: " + str(self.es_info))
+        
+        logging.debug(f"[MAIN] Connected to Elasticsearch at " + str(self.es_info))
         logging.debug(f"[MAIN] Start parsing {args.filename}.")
         logging.debug(f"[MAIN] Pushing on {args.name} index and {args.index} timeline")
 
-    def handle_stateagentinspector(self, path, item_detail):
+        return True
+
+    def recursive_dict(self, element):
         """
-            handle_item: streaming function for xmltodict (stateagentitem)
+            recursive function to convert lxml ElementTree to OrderedDict
+        """
+        if element.text == None and len(element.attrib):
+            return element.tag, element.attrib
+        return element.tag, \
+                collections.OrderedDict(dict(map(self.recursive_dict, element))) or element.text
+
+    def handle_stateagentinspector(self, tree):
+        """
+            handle_item: streaming function for lxml (stateagentitem)
             In:
-                path: xml item path
+                tree: lxml ElementTree
         """
+        data = self.recursive_dict(tree)[1]
+
         item = {}
-        uid = path[1][1]["uid"]
+        uid = tree.get("uid")
         item["uid"] = uid
-        item["SubEventType"] = item_detail["eventType"]
+        item["SubEventType"] = data["eventType"]
         # stateagentinspector has only timestamp field and is parsed now!
         datetime, timestamp = convert_both(
-            item_detail["timestamp"], self.offset_stateagentinspector
+            data["timestamp"], self.offset_stateagentinspector
         )
         item["timestamp"] = timestamp
         item["datetime"] = datetime
         item["datetype"] = "timestamp"
-        item["message"] = item_detail["eventType"]
-        if type(item_detail["details"]["detail"]) in (collections.OrderedDict, dict):
-            x = item_detail["details"]["detail"]
+        item["message"] = data["eventType"]
+        if type(data["details"]["detail"]) in (collections.OrderedDict, dict):
+            x = data["details"]["detail"]
         else:
-            for x in item_detail["details"]["detail"]:
+            for x in data["details"]["detail"]:
                 item[x["name"]] = x["value"]
         if uid in self.ioc_alerts:
             item["source"] = "IOC"
@@ -266,34 +281,41 @@ class MansToEs:
             item["ALERT"] = True
             item["alert_code"] = (
                 MANS_FIELDS["stateagentinspector"]["SubEventType"]
-                .get(item_detail["eventType"], {})
+                .get(data["eventType"], {})
                 .get("hits_key", None),
             )
-        self.generic_items.setdefault(path[1][0], []).append(item)
+        self.generic_items.setdefault(tree.tag, []).append(item)
+        
         return True
 
-    def handle_item(self, path, item_detail):
+    def handle_item(self, tree):
         """
-            handle_item: streaming function for xmltodict
+            handle_item: streaming function for lxml etree
             In:
-                path: xml item path
-                item_detail: xml item data
+                tree: lxml ElementTree
         """
-        item_detail["message"] = path[1][0]
-        self.generic_items.setdefault(path[1][0], []).append(item_detail)
+
+        data = self.recursive_dict(tree)[1]
+        data["message"] = tree.tag
+        self.generic_items.setdefault(tree.tag, []).append(data)
+
         return True
 
     def generate_df(self, file, offset, filetype, stateagentinspector=False):
         """
             Generate dataframe from xml file
         """
-        xmltodict.parse(
-            file.read(),
-            item_depth=2,
-            item_callback=self.handle_stateagentinspector
-            if stateagentinspector
-            else self.handle_item,
-        )
+        
+        # Parsing with lxml (modified from xmltodict)
+        
+        etree = lxml_etree.parse(file)
+
+        for f in etree.getroot():
+            if stateagentinspector:
+                self.handle_stateagentinspector(f)
+            else:
+                self.handle_item(f)
+
         key_type = MANS_FIELDS[filetype]["key"]
         if self.generic_items.get(key_type, []) == []:
             return None, False
@@ -308,12 +330,12 @@ class MansToEs:
         zip_ref = zipfile.ZipFile(self.filename, "r")
         zip_ref.extractall(self.folder_path)
         zip_ref.close()
-        logging.debug(f"[MAIN] Unzip file in {self.folder_path} [✔]")
+        logging.debug(f"[MAIN] Unzip file in {self.folder_path} [complete]")
 
     def delete_temp_folder(self):
         try:
             shutil.rmtree(self.folder_path)
-            logging.debug("[MAIN] temporary folder deleted [✔]")
+            logging.debug("[MAIN] temporary folder deleted [complete]")
         except:
             logging.warning("[MAIN - WARNING] failed to delete temporary folder")
 
@@ -335,7 +357,7 @@ class MansToEs:
                         self.filelist[item["generator"]].append(
                             (res["payload"], convert_skew(res["timestamps"][0]["skew"]))
                         )
-        logging.debug("[MAIN] Parsing Manifest.json [✔]")
+        logging.debug("[MAIN] Parsing Manifest.json [complete]")
 
     def parse_hits(self):
         """
@@ -379,7 +401,7 @@ class MansToEs:
                     es, self.exd_alerts, index=self.index, doc_type="generic_event"
                 )
             logging.debug(
-                "[MAIN] Parsing Hits.json - %d alerts found [✔]"
+                "[MAIN] Parsing Hits.json - %d alerts found [complete]"
                 % (len(self.exd_alerts) + len(self.ioc_alerts))
             )
 
@@ -403,24 +425,23 @@ class MansToEs:
             # Read all files related to the type
             for (file, offset) in self.filelist[filetype]:
                 files_list.append((filetype, file, offset))
-
         with Pool(processes=self.cpu_count) as pool:
             res = pool.starmap_async(self.process_file, files_list).get()
-        logging.debug("[MAIN] Pre-Processing [✔]")
+        logging.debug("[MAIN] Pre-Processing [complete]")
 
     def process_file(self, filetype, file, offset):
         """
             process_file: parse xml to df and clean it
             In:
                 filetype: filetype of the xml
-                file: xml file pointer 
+                file: xml file pointer
                 offset: offset to add to date fields
         """
         info = MANS_FIELDS[filetype]
 
         logging.debug(f"[{filetype:<20} {file}] df [ ] - date [ ] - message [ ]")
         df, valid = self.generate_df(
-            open(os.path.join(self.folder_path, file), "r", encoding="utf8"),
+            open(os.path.join(self.folder_path, file), "rb"),
             offset,
             filetype,
             filetype == "stateagentinspector",
@@ -472,7 +493,7 @@ class MansToEs:
                     )
                 subdf.loc[:, "timestamp_desc"] = subdf.loc[:, "message"]
                 logging.debug(
-                    f"[{filetype:<20} {sb:<24} {file}] df [✔] - date [✔] - message [✔]"
+                    f"[{filetype:<20} {sb:<24} {file}] df [complete] - date [complete] - message [complete]"
                 )
                 subdf.dropna(axis=1, how="all").to_json(
                     os.path.join(self.folder_path, f"tmp___{sb}_{file}.json"),
@@ -480,7 +501,7 @@ class MansToEs:
                     lines=True,
                 )
         else:
-            logging.debug(f"[{filetype:<20} {file}] df [✔] - date [ ] - message [ ]")
+            logging.debug(f"[{filetype:<20} {file}] df [complete] - date [ ] - message [ ]")
             # melt multiple date fields
             if len(datefields) > 1:
                 df = df.melt(
@@ -498,7 +519,7 @@ class MansToEs:
                 lambda x: convert_both_pandas(x, offset)
             )
 
-            logging.debug(f"[{filetype:<20} {file}] df [✔] - date [✔] - message [ ]")
+            logging.debug(f"[{filetype:<20} {file}] df [complete] - date [complete] - message [ ]")
 
             # Add messages based on selected fields value
             if info.get("message_fields", None):
@@ -519,7 +540,7 @@ class MansToEs:
                     lambda row: row["message"] + " [%s]" % row["datetype"], axis=1
                 )
             df.loc[:, "timestamp_desc"] = df.loc[:, "message"]
-            logging.debug(f"[{filetype:<20} {file}] df [✔] - date [✔] - message [✔]")
+            logging.debug(f"[{filetype:<20} {file}] df [complete] - date [complete] - message [complete]")
             df.dropna(axis=1, how="all").to_json(
                 os.path.join(self.folder_path, f"tmp___{file}.json"),
                 orient="records",
@@ -547,7 +568,7 @@ class MansToEs:
             ),
             maxlen=0,
         )
-        logging.debug("[MAIN] Parallel elastic push [✔]")
+        logging.debug("[MAIN] Parallel elastic push [complete]")
 
 
 def main():
@@ -565,7 +586,7 @@ def main():
     parser.add_argument(
         "--cpu_count",
         dest="cpu_count",
-        default=cpu_count() - 1,
+        default=cpu_count(),
         help="cpu count",
         type=int,
     )
@@ -593,7 +614,7 @@ def main():
             mte.process()
             mte.to_elastic()
             mte.delete_temp_folder()
-            logging.debug("[MAIN] Operation Completed [✔✔✔]")
+            logging.debug("[MAIN] Operation Completed [COMPLETE]")
         except:
             logging.exception("Error parsing .mans")
             return False
