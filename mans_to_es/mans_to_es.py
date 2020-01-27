@@ -239,8 +239,6 @@ class MansToEs:
         logging.debug(f"[MAIN] Start parsing {args.filename}.")
         logging.debug(f"[MAIN] Pushing on {args.name} index and {args.index} timeline")
 
-        return True
-
     def recursive_dict(self, element):
         """
             recursive function to convert lxml ElementTree to OrderedDict
