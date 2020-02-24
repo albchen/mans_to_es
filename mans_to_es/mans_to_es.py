@@ -245,7 +245,18 @@ class MansToEs:
         """
         if element.text == None and len(element.attrib):
             return element.tag, element.attrib
-        return element.tag, \
+
+        # add details to a single detail list
+        if element.tag == "details":
+            detail = []
+            for i in element.iter():
+                if i.tag == "detail":
+                    for e in i.iter():
+                        if not e.tag == "name" and not e.tag == "value":
+                            detail.append(collections.OrderedDict(dict(map(self.recursive_dict, e) or e.text)))
+            return element.tag, collections.OrderedDict([('detail', detail)])
+        else:
+            return element.tag, \
                 collections.OrderedDict(dict(map(self.recursive_dict, element))) or element.text
 
     def handle_stateagentinspector(self, tree):
